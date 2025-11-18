@@ -529,6 +529,32 @@ public class YajsyncClient
             stats.totalBytesRead());
     }
 
+    private String showStatisticsString(Statistics stats)
+    {
+        return String.format("Number of files: %d%n" +
+                        "Number of files transferred: %d%n" +
+                        "Total file size: %d bytes%n" +
+                        "Total transferred file size: %d bytes%n" +
+                        "Literal data: %d bytes%n" +
+                        "Matched data: %d bytes%n" +
+                        "File list size: %d%n" +
+                        "File list generation time: %.3f seconds%n" +
+                        "File list transfer time: %.3f seconds%n" +
+                        "Total bytes sent: %d%n" +
+                        "Total bytes received: %d%n",
+                stats.numFiles(),
+                stats.numTransferredFiles(),
+                stats.totalFileSize(),
+                stats.totalTransferredSize(),
+                stats.totalLiteralSize(),
+                stats.totalMatchedSize(),
+                stats.totalFileListSize(),
+                stats.fileListBuildTime() / 1000.0,
+                stats.fileListTransferTime() / 1000.0,
+                stats.totalBytesWritten(),
+                stats.totalBytesRead());
+    }
+
     private static List<String> readLinesFromStdin() throws IOException
     {
         List<String> lines = new LinkedList<>();
@@ -555,7 +581,8 @@ public class YajsyncClient
 
     private RsyncClient.Result remoteTransfer(Mode mode,
                                               RsyncUrls srcArgs,
-                                              RsyncUrl dstArgOrNull)
+                                              RsyncUrl dstArgOrNull,
+                                              StringBuilder logsError)
             throws RsyncException, InterruptedException
     {
         ConnInfo connInfo = srcArgs.isRemote()
@@ -626,18 +653,140 @@ public class YajsyncClient
                 _log.severe(String.format("Error: failed to resolve %s (%s)",
                                           connInfo.address(), e.getMessage()));
             }
+            logsError.append("Yajsync - Error: socket open/close error: ").append(connInfo.address()).append(e.getMessage()).append("\n");
         } catch (IOException e) { // SocketChannel.{open,close}()
             if (_log.isLoggable(Level.SEVERE)) {
                 _log.severe("Error: socket open/close error: " +
                             e.getMessage());
             }
+            logsError.append("Yajsync - Error: socket open/close error: ").append(e.getMessage()).append("\n");
         } catch (ChannelException e) {
             if (_log.isLoggable(Level.SEVERE)) {
                 _log.log(Level.SEVERE,
                         "Error: communication closed with peer: ", e);
             }
+            logsError.append("Yajsync - Error: communication closed with peer: ").append(e.getMessage()).append("\n");
         }
         return RsyncClient.Result.failure();
+    }
+
+    public String startSplink(String[] args)
+    {
+        StringBuilder logsExecucao = new StringBuilder("Yajsync - Iniciando processo rsync").append("\n");
+        ArgumentParser argsParser =
+                ArgumentParser.newWithUnnamed(getClass().getSimpleName(),
+                        "files...");
+        argsParser.addHelpTextDestination(_stdout);
+        logsExecucao.append("Yajsync - Dados enviados ao rsync: ").append(Arrays.toString(args)).append("\n");
+
+        try {
+            for (Option o : options()) {
+                argsParser.add(o);
+            }
+            ArgumentParser.Status rc = argsParser.parse(Arrays.asList(args));
+            if (rc != ArgumentParser.Status.CONTINUE) {
+                return "Yajsync - Erro na integracao spLinker com rsync";
+            }
+            _cwd = _fs.getPath(_cwdName);
+
+            List<String> unnamed = new LinkedList<>();
+            if (_readStdin) {
+                unnamed.addAll(readLinesFromStdin());
+            }
+            unnamed.addAll(argsParser.getUnnamedArguments());
+
+            Triple<Mode, RsyncUrls, RsyncUrl> res = parseUnnamedArgs(unnamed);
+            Mode mode = res.first();
+            RsyncUrls srcArgs = res.second();
+            RsyncUrl dstArgOrNull = res.third();
+
+            if (_remotePort != PORT_UNDEFINED && mode.isRemote()) {
+                Pair<RsyncUrls, RsyncUrl> res2 = updateRemotePort(_cwd,
+                        _remotePort,
+                        srcArgs,
+                        dstArgOrNull);
+                srcArgs = res2.first();
+                dstArgOrNull = res2.second();
+            }
+
+            Level logLevel = Util.getLogLevelForNumber(
+                    Util.WARNING_LOG_LEVEL_NUM + _verbosity);
+            Util.setRootLogLevel(logLevel);
+            if (_log.isLoggable(Level.FINE)) {
+                _log.fine(String.format("%s src: %s, dst: %s",
+                        mode, srcArgs, dstArgOrNull));
+            }
+            logsExecucao.append(String.format("Yajsync -  %s src: %s, dst: %s",
+                    mode, srcArgs, dstArgOrNull)).append("\n");
+
+            RsyncClient.Result result;
+            if (mode.isRemote()) {
+                result = remoteTransfer(mode, srcArgs, dstArgOrNull, logsExecucao);
+            } else if (mode == Mode.LOCAL_COPY) {
+                if (_log.isLoggable(Level.FINE)) {
+                    _log.fine("starting local transfer (using rsync's delta " +
+                            "transfer algorithm - i.e. will not run with a " +
+                            "--whole-file option, so performance is most " +
+                            "probably lower than rsync)");
+                }
+                logsExecucao.append("Yajsync - starting local transfer (using rsync's delta " +
+                        "transfer algorithm - i.e. will not run with a " +
+                        "--whole-file option, so performance is most " +
+                        "probably lower than rsync)").append("\n");
+                result = _clientBuilder.buildLocal().
+                        copy(getPaths(srcArgs.pathNames())).
+                        to(PathOps.get(_cwd.getFileSystem(),
+                                dstArgOrNull.pathName()));
+            } else if (mode == Mode.LOCAL_LIST) {
+                RsyncClient.FileListing listing = _clientBuilder.
+                        buildLocal().
+                        list(getPaths(srcArgs.pathNames()));
+                while (true) {
+                    FileInfo f = listing.take();
+                    boolean isDone = f == null;
+                    if (isDone) {
+                        result = listing.get();
+                        break;
+                    }
+                    System.out.println(fileInfoToListingString(f));
+                    logsExecucao.append("Yajsync -").append(fileInfoToListingString(f)).append("\n");
+                }
+            } else {
+                throw new AssertionError();
+            }
+            _statistics = result.statistics();
+            if (_isShowStatistics) {
+                showStatistics(result.statistics());
+            }
+            if (_log.isLoggable(Level.INFO)) {
+                _log.info("exit status: " + (result.isOK() ? "OK" : "ERROR"));
+            }
+            logsExecucao.append("Yajsycn - ").append(showStatisticsString(result.statistics()));
+            logsExecucao.append("Yajsync - Status: ").append(result.isOK() ? "OK" : "ERROR").append("\n");
+            logsExecucao.append("Yajsync - Processo do rsync finalizado!");
+            return logsExecucao.toString();
+
+        } catch (ArgumentParsingError e) {
+            _stderr.println(e.getMessage());
+            _stderr.println(argsParser.toUsageString());
+            logsExecucao.append("Yajsync - Error: ").append(e.getMessage()).append("\n");
+        } catch (IOException e) { // reading from stdinp
+            _stderr.println(e.getMessage());
+            logsExecucao.append("Yajsync - Error: ").append(e.getMessage()).append("\n");
+        } catch (RsyncException e) {
+            if (_log.isLoggable(Level.SEVERE)) {
+                _log.severe(e.getMessage());
+            }
+            logsExecucao.append("Yajsync - Error: ").append(e.getMessage()).append("\n");
+        } catch (InterruptedException e) {
+            if (_log.isLoggable(Level.SEVERE)) {
+                _log.log(Level.SEVERE, "", e);
+            }
+            logsExecucao.append("Yajsync - Error: ").append(e.getMessage()).append("\n");
+        } finally {
+            logsExecucao.append("Yajsync - Processo do rsync finalizado!");
+        }
+        return logsExecucao.toString();
     }
 
     public int start(String[] args)
@@ -687,7 +836,7 @@ public class YajsyncClient
 
             RsyncClient.Result result;
             if (mode.isRemote()) {
-                result = remoteTransfer(mode, srcArgs, dstArgOrNull);
+                result = remoteTransfer(mode, srcArgs, dstArgOrNull, new StringBuilder());
             } else if (mode == Mode.LOCAL_COPY) {
                 if (_log.isLoggable(Level.FINE)) {
                     _log.fine("starting local transfer (using rsync's delta " +
